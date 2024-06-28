@@ -54,7 +54,7 @@ render_as_ihtml <- function(data, id) {
   has_tab_spanners <- dt_spanners_exists(data = data)
 
   # Obtain the language from the `locale`, if provided
-  locale <- dt_locale_get_value(data = data)
+  locale <- normalize_locale(dt_locale_get_value(data = data))
 
   # Generate a `lang_defs` object to pass to the `language` argument
   if (is.null(locale) || locale == "en") {
@@ -98,15 +98,15 @@ render_as_ihtml <- function(data, id) {
     }
   }
 
-  # Obtain the underlying data table
-  data_tbl <- dt_data_get(data = data)
+  # Obtain the underlying data table (including group rows)
+  data_tbl0 <- dt_data_get(data = data)
 
   #
-  # Only preserve columns that are not hidden
+  # Only preserve columns that are not hidden (group cols will be added later)
   #
 
   data_tbl_vars <- dt_boxhead_get_vars_default(data = data)
-  data_tbl <- data_tbl[, data_tbl_vars, drop = FALSE]
+  data_tbl <- data_tbl0[, data_tbl_vars, drop = FALSE]
 
   #nocov start
 
@@ -122,15 +122,33 @@ render_as_ihtml <- function(data, id) {
 
   #nocov end
 
+  rownames_to_stub <- stub_rownames_has_column(data)
+  # use of special .rownames doesn't work.
+  # Workaround https://github.com/glin/reactable/issues/378
+  # rstudio/gt#1702
+  if (rownames_to_stub) {
+    rowname_col <- dt_boxhead_get_var_stub(data)
+    if (length(rowname_col) == 1) {
+      # avoid base R error when setting duplicate row names.
+      attr(data_tbl, "row.names") <-  as.character(data$`_data`[[rowname_col]])
+    }
+  }
+
   # Obtain column label attributes
   column_names  <- dt_boxhead_get_vars_default(data = data)
   column_labels <- dt_boxhead_get_vars_labels_default(data = data)
   column_alignments <- dt_boxhead_get_vars_align_default(data = data)
+  column_groups <- dt_boxhead_get_vars_groups(data = data)
+  # if dt_boxhead_get_vars_groups is fixed, this will no longer be necessary.
+  if (identical(column_groups, NA_character_)) {
+    column_groups <- NULL
+  }
 
   # Obtain widths for each visible column label
   boxh <- dt_boxhead_get(data = data)
-  column_widths <- dplyr::filter(boxh, type %in% c("default", "stub"))
-  column_widths <- dplyr::pull(dplyr::arrange(column_widths, dplyr::desc(type)), column_width)
+  column_widths <- boxh[boxh$type %in% c("default", "stub"), , drop = FALSE]
+  # ensure that stub is first
+  column_widths <- column_widths[order(column_widths$type, decreasing = TRUE), "column_width", drop = TRUE]
   column_widths <- unlist(column_widths)
 
   # Transform any column widths to integer values
@@ -139,7 +157,7 @@ render_as_ihtml <- function(data, id) {
     column_widths <-
       vapply(
         column_widths,
-        FUN.VALUE = integer(1),
+        FUN.VALUE = integer(1L),
         USE.NAMES = FALSE,
         FUN = function(x) {
           if (grepl("px", x)) {
@@ -154,6 +172,7 @@ render_as_ihtml <- function(data, id) {
 
   # Get options settable in `tab_options()`
   opt_val <- dt_options_get_value
+  height <- opt_val(data = data, option = "ihtml_height")
   use_pagination <- opt_val(data = data, option = "ihtml_use_pagination")
   use_pagination_info <- opt_val(data = data, option = "ihtml_use_pagination_info")
   use_search <- opt_val(data = data, option = "ihtml_use_search")
@@ -199,23 +218,75 @@ render_as_ihtml <- function(data, id) {
 
   if (table_width == "auto") table_width <- NULL
 
+
+  #
+  # Determine which columns will undergo some formatting
+  #
+  formats <- dt_formats_get(data = data)
+
+  # Get a list of vectors that include columns taking part
+  # in some formatting operation
+  formatted_columns <-
+    lapply(
+      formats,
+      FUN = function(x) {
+
+        columns <- x$cols
+        rows <- x$rows
+        compat <- x$compat
+
+        compat_columns <- c()
+
+        for (col in columns) {
+
+          if (
+            col %in% colnames(data_tbl) &&
+            is_compatible_formatter(
+              table = data_tbl,
+              column = col,
+              rows = rows,
+              compat = compat
+            )
+          ) {
+            compat_columns <- c(compat_columns, col)
+          }
+
+        }
+        compat_columns
+      }
+    )
+
+  # Flatten this list of vectors to a single vector of unique column names
+  formatted_columns <- unique(flatten_list(formatted_columns))
+
   # Create a list of column definitions
   col_defs <-
     lapply(
       seq_along(column_names),
       FUN = function(x) {
 
-        formatted_cells <-
-          extract_cells(
-            data = data,
-            columns = column_names[x],
-            output = "html"
-          )
+        # Only perform extraction of formatted cells if there is an
+        # indication that formatting will be performed on a column`
+        if (column_names[x] %in% formatted_columns) {
+
+          formatted_cells <-
+            extract_cells(
+              data = data,
+              columns = column_names[x],
+              output = "html"
+            )
+
+          cell_fn <- function(value, index) formatted_cells[index]
+        } else {
+          cell_fn <- NULL
+        }
 
         reactable::colDef(
-          cell = function(value, index) formatted_cells[index],
+          cell = cell_fn,
           name = column_labels[x],
           align = column_alignments[x],
+          # TODO support `summary_rows()` via `aggregate` #1359
+          # TODO support `grand_summary_rows()` via `footer`. #1359
           headerStyle = list(`font-weight` = "normal"),
           width = if (is.null(column_widths) || is.na(column_widths[x])) NULL else column_widths[x],
           html = TRUE
@@ -224,6 +295,45 @@ render_as_ihtml <- function(data, id) {
     )
   names(col_defs) <- column_names
 
+  # Customize groupname_col and add to data_tbl
+  if (!is.null(column_groups)) {
+    # FIXME how should row_groups_as_column behave?
+    # FIXME find a way to remove borders to act like it is the value for the group
+    # should it just be a normal row at the left?
+    group_col_defs <- list()
+    # Hack from glin/reactable#94 to hide the number of observations
+    grp_fn <- reactable::JS("
+      function(cellInfo) {
+        return cellInfo.value
+      }")
+    for (i in seq_along(column_groups)) {
+      group_col_defs[[i]] <- reactable::colDef(
+        name = "",
+        grouped = grp_fn,
+        # FIXME Should groups be sticky? (or provide a way to do this)
+        sticky = NULL
+      )
+
+    }
+    names(group_col_defs) <- column_groups
+    # Add group colDef to general col_def
+    col_defs <- c(col_defs, group_col_defs)
+    groupname_col <- column_groups
+    # for defaultExpanded = TRUE
+    expand_groupname_col <- TRUE
+
+    # modify data_tbl to include
+    data_tbl <- dplyr::bind_cols(
+      data_tbl,
+      data_tbl0[ , groupname_col, drop = FALSE]
+    )
+
+    # Set number of rows to FALSE, since it is inacurrate
+    # Otherwise, it just shows the number of groups
+  }  else {
+    groupname_col <- NULL
+    expand_groupname_col <- FALSE
+  }
   #
   # Generate custom styles for `defaultColDef`
   #
@@ -237,7 +347,7 @@ render_as_ihtml <- function(data, id) {
   # `rownum` in `body_styles_tbl`
   body_style_rules <-
     vapply(
-      seq_len(nrow(body_styles_tbl)), FUN.VALUE = character(1), USE.NAMES = FALSE,
+      seq_len(nrow(body_styles_tbl)), FUN.VALUE = character(1L), USE.NAMES = FALSE,
       FUN = function(x) {
 
         colname <- body_styles_tbl[x, ][["colname"]]
@@ -270,7 +380,9 @@ render_as_ihtml <- function(data, id) {
 
   default_col_def <-
     reactable::colDef(
-      style = reactable::JS(body_style_js_str)
+      style = reactable::JS(body_style_js_str),
+      minWidth = 125,
+      width = NULL
     )
 
   # Generate the table header if there are any heading components
@@ -347,7 +459,18 @@ render_as_ihtml <- function(data, id) {
   colgroups_def <- NULL
 
   if (has_tab_spanners) {
-    col_groups <- (dt_spanners_get(data = data) %>% dplyr::filter(spanner_level == 1))
+
+    hidden_columns <- dt_boxhead_get_var_by_type(data = data, type = "hidden")
+    col_groups <- dplyr::filter(dt_spanners_get(data = data), spanner_level == 1)
+
+    for (i in seq_len(nrow(col_groups))) {
+
+      columns_group_i <- unlist(col_groups[i, ][["vars"]])
+
+      columns_group_i_diff <- base::setdiff(columns_group_i, hidden_columns)
+
+      col_groups[i, ][["vars"]][[1]] <- columns_group_i_diff
+    }
 
     if (max(dt_spanners_get(data = data)$spanner_level) > 1) {
       first_colgroups <- base::paste0(col_groups$built, collapse = "|")
@@ -377,8 +500,12 @@ render_as_ihtml <- function(data, id) {
               borderBottomStyle = column_labels_border_bottom_style,
               borderBottomWidth = column_labels_border_bottom_width,
               borderBottomColor = column_labels_border_bottom_color,
-              marginLeft = "4px",
-              marginRight = "4px"
+              borderLeftStyle =  column_labels_border_bottom_style,
+              borderLeftWidth =  "4px",
+              borderLeftColor =  "transparent",
+              borderRightStyle = column_labels_border_bottom_style,
+              borderRightWidth = "4px",
+              borderRightColor = "transparent"
             )
           )
         }
@@ -435,8 +562,8 @@ render_as_ihtml <- function(data, id) {
       data = data_tbl,
       columns = col_defs,
       columnGroups = colgroups_def,
-      rownames = NULL,
-      groupBy = NULL,
+      rownames = rownames_to_stub,
+      groupBy = groupname_col,
       sortable = use_sorting,
       resizable = use_resizers,
       filterable = use_filters,
@@ -451,12 +578,12 @@ render_as_ihtml <- function(data, id) {
       showPageSizeOptions = use_page_size_select,
       pageSizeOptions = page_size_values,
       paginationType = pagination_type,
-      showPagination = TRUE,
+      showPagination = use_pagination,
       showPageInfo = use_pagination_info,
       minRows = 1,
       paginateSubRows = FALSE,
       details = NULL,
-      defaultExpanded = FALSE,
+      defaultExpanded = expand_groupname_col,
       selection = NULL,
       selectionId = NULL,
       defaultSelected = NULL,
@@ -469,14 +596,14 @@ render_as_ihtml <- function(data, id) {
       compact = use_compact_mode,
       wrap = use_text_wrapping,
       showSortIcon = TRUE,
-      showSortable = TRUE,
+      showSortable = FALSE,
       class = NULL,
       style = NULL,
       rowClass = NULL,
       rowStyle = NULL,
       fullWidth = TRUE,
       width = table_width,
-      height = "auto",
+      height = height,
       theme = tbl_theme,
       language = lang_defs,
       elementId = id,
